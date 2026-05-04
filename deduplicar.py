@@ -4,7 +4,6 @@ import re
 from io import BytesIO
 
 import pandas as pd
-import streamlit as st
 
 
 REPEATED_DIGITS_RE = re.compile(r"^(\d)\1+$")
@@ -93,17 +92,70 @@ def read_file(uploaded_file) -> pd.DataFrame:
     raise ValueError("Sube un archivo CSV, XLSX o XLS.")
 
 
-def analyze_phones(df: pd.DataFrame, agency_col: str, phone_col: str):
-    work = df[[agency_col, phone_col]].copy()
-    work.columns = ["agencia", "telefono_original"]
+def has_value(value: object) -> bool:
+    return not pd.isna(value) and str(value).strip() != ""
+
+
+def analyze_phones(df: pd.DataFrame, agency_col: str, phone_cols: list[str], count_empty_rows: bool = True):
+    base_cols = [agency_col] + phone_cols
+    base = df[base_cols].copy()
+    base["_row_id"] = range(1, len(base) + 1)
+
+    rows = []
+    for _, row in base.iterrows():
+        agency = row[agency_col]
+        phones_found = False
+
+        for phone_col in phone_cols:
+            original = row[phone_col]
+            if not has_value(original):
+                continue
+
+            phones_found = True
+            rows.append(
+                {
+                    "fila": row["_row_id"],
+                    "agencia": agency,
+                    "columna_telefono": phone_col,
+                    "telefono_original": original,
+                }
+            )
+
+        if count_empty_rows and not phones_found:
+            rows.append(
+                {
+                    "fila": row["_row_id"],
+                    "agencia": agency,
+                    "columna_telefono": "Sin telefono",
+                    "telefono_original": "",
+                }
+            )
+
+    work = pd.DataFrame(rows)
+
+    if work.empty:
+        work = pd.DataFrame(
+            columns=[
+                "fila",
+                "agencia",
+                "columna_telefono",
+                "telefono_original",
+                "telefono_normalizado",
+                "es_repetido",
+            ]
+        )
 
     work["agencia"] = work["agencia"].fillna("Sin agencia").astype(str).str.strip()
     work.loc[work["agencia"].eq(""), "agencia"] = "Sin agencia"
 
     work["telefono_normalizado"] = work["telefono_original"].apply(normalize_phone)
+    work["clave_deduplicado"] = work.apply(
+        lambda row: row["telefono_normalizado"] if row["telefono_normalizado"] else f"__sin_telefono__{row['fila']}",
+        axis=1,
+    )
 
     work["es_repetido"] = work.duplicated(
-        subset=["agencia", "telefono_normalizado"],
+        subset=["agencia", "clave_deduplicado"],
         keep="first",
     )
 
@@ -145,12 +197,12 @@ def analyze_phones(df: pd.DataFrame, agency_col: str, phone_col: str):
 
     invalids = deduped.loc[
         ~deduped["es_valido"],
-        ["agencia", "telefono_original", "telefono_normalizado", "motivos_texto"],
+        ["fila", "agencia", "columna_telefono", "telefono_original", "telefono_normalizado", "motivos_texto"],
     ].sort_values(["agencia", "telefono_normalizado"])
 
     duplicates = work.loc[
         work["es_repetido"],
-        ["agencia", "telefono_original", "telefono_normalizado"],
+        ["fila", "agencia", "columna_telefono", "telefono_original", "telefono_normalizado"],
     ].sort_values(["agencia", "telefono_normalizado"])
 
     return summary, invalids, duplicates
@@ -177,87 +229,113 @@ def guess_column(columns: list[str], options: list[str]) -> str | None:
     return None
 
 
-st.set_page_config(page_title="Validador de telefonos", layout="wide")
+def main() -> None:
+    import streamlit as st
 
-st.title("Validador de telefonos por agencia")
+    st.set_page_config(page_title="Validador de telefonos", layout="wide")
 
-uploaded_file = st.file_uploader(
-    "Sube un archivo con una columna de agencia y otra de telefono",
-    type=["csv", "xlsx", "xls"],
-)
+    st.title("Validador de telefonos por agencia")
 
-if uploaded_file is None:
-    st.info("Sube un CSV o Excel. Despues eliges la columna de agencia y la columna de telefono.")
-    st.stop()
-
-try:
-    df = read_file(uploaded_file)
-except Exception as error:
-    st.error(f"No he podido leer el archivo: {error}")
-    st.stop()
-
-if df.empty:
-    st.warning("El archivo esta vacio.")
-    st.stop()
-
-columns = list(df.columns)
-
-agency_guess = guess_column(columns, ["agencia", "agency", "fuente", "origen"])
-phone_guess = guess_column(columns, ["telefono", "teléfono", "phone", "movil", "móvil", "mobile"])
-
-col1, col2 = st.columns(2)
-
-with col1:
-    agency_col = st.selectbox(
-        "Columna de agencia",
-        columns,
-        index=columns.index(agency_guess) if agency_guess in columns else 0,
+    uploaded_file = st.file_uploader(
+        "Sube un archivo con una columna de agencia y una o varias columnas de telefono",
+        type=["csv", "xlsx", "xls"],
     )
 
-with col2:
-    phone_col = st.selectbox(
-        "Columna de telefono",
-        columns,
-        index=columns.index(phone_guess) if phone_guess in columns else min(1, len(columns) - 1),
+    if uploaded_file is None:
+        st.info("Sube un CSV o Excel. Despues eliges la columna de agencia y todas las columnas de telefono.")
+        st.stop()
+
+    try:
+        df = read_file(uploaded_file)
+    except Exception as error:
+        st.error(f"No he podido leer el archivo: {error}")
+        st.stop()
+
+    if df.empty:
+        st.warning("El archivo esta vacio.")
+        st.stop()
+
+    columns = list(df.columns)
+
+    agency_guess = guess_column(columns, ["agencia", "agency", "fuente", "origen"])
+    phone_guesses = [
+        col
+        for col in columns
+        if any(
+            keyword in col.lower()
+            for keyword in ["telefono", "teléfono", "phone", "movil", "móvil", "mobile"]
+        )
+    ]
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        agency_col = st.selectbox(
+            "Columna de agencia",
+            columns,
+            index=columns.index(agency_guess) if agency_guess in columns else 0,
+        )
+
+    with col2:
+        phone_cols = st.multiselect(
+            "Columnas de telefono",
+            columns,
+            default=phone_guesses if phone_guesses else columns[1:2],
+        )
+
+    phone_cols = [col for col in phone_cols if col != agency_col]
+
+    if not phone_cols:
+        st.error("Elige al menos una columna de telefono distinta a la columna de agencia.")
+        st.stop()
+
+    count_empty_rows = st.checkbox(
+        "Contar filas sin ningun telefono como no validas",
+        value=True,
     )
 
-if agency_col == phone_col:
-    st.error("La columna de agencia y la columna de telefono no pueden ser la misma.")
-    st.stop()
+    summary, invalids, duplicates = analyze_phones(
+        df,
+        agency_col,
+        phone_cols,
+        count_empty_rows=count_empty_rows,
+    )
 
-summary, invalids, duplicates = analyze_phones(df, agency_col, phone_col)
+    total_phones = int(summary["telefonos_totales"].sum())
+    total_deduped = int(summary["telefonos_deduplicados"].sum())
+    total_valid = int(summary["telefonos_validos"].sum())
+    total_invalid = int(summary["telefonos_no_validos"].sum())
 
-total_phones = int(summary["telefonos_totales"].sum())
-total_deduped = int(summary["telefonos_deduplicados"].sum())
-total_valid = int(summary["telefonos_validos"].sum())
-total_invalid = int(summary["telefonos_no_validos"].sum())
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Telefonos totales", total_phones)
+    m2.metric("Telefonos deduplicados", total_deduped)
+    m3.metric("Telefonos validos", total_valid)
+    m4.metric("Telefonos no validos", total_invalid)
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Telefonos totales", total_phones)
-m2.metric("Telefonos deduplicados", total_deduped)
-m3.metric("Telefonos validos", total_valid)
-m4.metric("Telefonos no validos", total_invalid)
+    st.subheader("Resumen por agencia")
+    st.dataframe(summary, use_container_width=True, hide_index=True)
 
-st.subheader("Resumen por agencia")
-st.dataframe(summary, use_container_width=True, hide_index=True)
+    st.subheader("Telefonos no validos")
+    if invalids.empty:
+        st.success("No hay telefonos no validos.")
+    else:
+        st.dataframe(invalids, use_container_width=True, hide_index=True)
 
-st.subheader("Telefonos no validos")
-if invalids.empty:
-    st.success("No hay telefonos no validos.")
-else:
-    st.dataframe(invalids, use_container_width=True, hide_index=True)
+    st.subheader("Telefonos repetidos")
+    if duplicates.empty:
+        st.success("No hay telefonos repetidos por agencia.")
+    else:
+        st.dataframe(duplicates, use_container_width=True, hide_index=True)
 
-st.subheader("Telefonos repetidos")
-if duplicates.empty:
-    st.success("No hay telefonos repetidos por agencia.")
-else:
-    st.dataframe(duplicates, use_container_width=True, hide_index=True)
+    excel_file = to_excel(summary, invalids, duplicates)
 
-excel_file = to_excel(summary, invalids, duplicates)
+    st.download_button(
+        label="Descargar resultado en Excel",
+        data=excel_file,
+        file_name="resultado_telefonos.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-st.download_button(
-    label="Descargar resultado en Excel",
-    data=excel_file,
-    file_name="resultado_telefonos.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+
+if __name__ == "__main__":
+    main()
