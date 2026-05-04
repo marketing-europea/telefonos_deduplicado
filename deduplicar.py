@@ -96,114 +96,176 @@ def has_value(value: object) -> bool:
     return not pd.isna(value) and str(value).strip() != ""
 
 
-def analyze_phones(df: pd.DataFrame, agency_col: str, phone_cols: list[str], count_empty_rows: bool = True):
-    base_cols = [agency_col] + phone_cols
+def analyze_phones(
+    df: pd.DataFrame,
+    agency_col: str,
+    phone_cols: list[str],
+    deal_id_col: str | None = None,
+):
+    base_cols = list(dict.fromkeys([agency_col] + phone_cols + ([deal_id_col] if deal_id_col else [])))
     base = df[base_cols].copy()
     base["_row_id"] = range(1, len(base) + 1)
 
-    rows = []
+    seen_valid_phones: dict[tuple[str, str], dict[str, object]] = {}
+    lead_rows = []
+
     for _, row in base.iterrows():
         agency = row[agency_col]
-        phones_found = False
+        if pd.isna(agency) or str(agency).strip() == "":
+            agency = "Sin agencia"
+        else:
+            agency = str(agency).strip()
 
+        deal_id = row[deal_id_col] if deal_id_col else ""
+        if pd.isna(deal_id):
+            deal_id = ""
+
+        candidates = []
         for phone_col in phone_cols:
             original = row[phone_col]
             if not has_value(original):
                 continue
 
-            phones_found = True
-            rows.append(
+            normalized = normalize_phone(original)
+            reasons = invalid_reasons(normalized)
+            candidates.append(
                 {
-                    "fila": row["_row_id"],
+                    "fila": int(row["_row_id"]),
                     "agencia": agency,
-                    "columna_telefono": phone_col,
+                    "columna": phone_col,
                     "telefono_original": original,
+                    "telefono_normalizado": normalized,
+                    "telefono_mostrar": phone_for_display(original, normalized),
+                    "motivos": reasons,
+                    "es_valido": len(reasons) == 0,
                 }
             )
 
-        if count_empty_rows and not phones_found:
-            rows.append(
-                {
-                    "fila": row["_row_id"],
-                    "agencia": agency,
-                    "columna_telefono": "Sin telefono",
-                    "telefono_original": "",
+        valid_candidates = []
+        phones_seen_in_this_lead = set()
+        for candidate in candidates:
+            normalized = candidate["telefono_normalizado"]
+            if not candidate["es_valido"] or normalized in phones_seen_in_this_lead:
+                continue
+            valid_candidates.append(candidate)
+            phones_seen_in_this_lead.add(normalized)
+
+        new_valid_candidates = [
+            candidate
+            for candidate in valid_candidates
+            if (agency, str(candidate["telefono_normalizado"])) not in seen_valid_phones
+        ]
+        repeated_candidates = [
+            candidate
+            for candidate in valid_candidates
+            if (agency, str(candidate["telefono_normalizado"])) in seen_valid_phones
+        ]
+
+        if new_valid_candidates:
+            status = "valido_unico"
+            main_valid = new_valid_candidates[0]
+            repeated = None
+        elif repeated_candidates:
+            status = "repetido"
+            main_valid = repeated_candidates[0]
+            repeated = seen_valid_phones[(agency, str(main_valid["telefono_normalizado"]))]
+        else:
+            status = "no_valido"
+            main_valid = None
+            repeated = None
+
+        for candidate in valid_candidates:
+            key = (agency, str(candidate["telefono_normalizado"]))
+            if key not in seen_valid_phones:
+                seen_valid_phones[key] = {
+                    "fila_original": candidate["fila"],
+                    "deal_id_original": deal_id,
+                    "columna_original": candidate["columna"],
+                    "telefono_original_primero": candidate["telefono_original"],
                 }
+
+        if not candidates:
+            phones_text = "sin telefono"
+            invalid_reason_text = "sin telefono en las columnas seleccionadas"
+        else:
+            phones_text = "; ".join(
+                f"{candidate['columna']}: {candidate['telefono_mostrar']}"
+                for candidate in candidates
+            )
+            invalid_reason_text = "; ".join(
+                f"{candidate['columna']}: {candidate['telefono_mostrar']} ({', '.join(candidate['motivos'])})"
+                for candidate in candidates
+                if not candidate["es_valido"]
             )
 
-    work = pd.DataFrame(rows)
-
-    if work.empty:
-        work = pd.DataFrame(
-            columns=[
-                "fila",
-                "agencia",
-                "columna_telefono",
-                "telefono_original",
-                "telefono_normalizado",
-                "es_repetido",
-            ]
+        lead_rows.append(
+            {
+                "fila": int(row["_row_id"]),
+                "deal_id": deal_id,
+                "agencia": agency,
+                "estado": status,
+                "tiene_algun_telefono": len(candidates) > 0,
+                "tiene_telefono_valido": len(valid_candidates) > 0,
+                "telefono_valido": main_valid["telefono_normalizado"] if main_valid else "",
+                "columna_telefono_valido": main_valid["columna"] if main_valid else "",
+                "telefonos_encontrados": phones_text,
+                "motivo_no_valido": invalid_reason_text,
+                "telefono_repetido": main_valid["telefono_normalizado"] if status == "repetido" else "",
+                "columna_telefono_repetido": main_valid["columna"] if status == "repetido" else "",
+                "fila_original_repetido": repeated["fila_original"] if repeated else "",
+                "deal_id_original_repetido": repeated["deal_id_original"] if repeated else "",
+                "columna_original_repetido": repeated["columna_original"] if repeated else "",
+            }
         )
 
-    work["agencia"] = work["agencia"].fillna("Sin agencia").astype(str).str.strip()
-    work.loc[work["agencia"].eq(""), "agencia"] = "Sin agencia"
+    leads = pd.DataFrame(lead_rows)
 
-    work["telefono_normalizado"] = work["telefono_original"].apply(normalize_phone)
-    work["clave_deduplicado"] = work.apply(
-        lambda row: row["telefono_normalizado"] if row["telefono_normalizado"] else f"__sin_telefono__{row['fila']}",
-        axis=1,
+    summary = leads.groupby("agencia").agg(
+        leads_totales=("fila", "count"),
+        leads_con_algun_telefono=("tiene_algun_telefono", "sum"),
+        leads_con_telefono_valido=("tiene_telefono_valido", "sum"),
     )
-
-    work["es_repetido"] = work.duplicated(
-        subset=["agencia", "clave_deduplicado"],
-        keep="first",
-    )
-
-    deduped = work.loc[~work["es_repetido"]].copy()
-    deduped["motivos"] = deduped["telefono_normalizado"].apply(invalid_reasons)
-    deduped["es_valido"] = deduped["motivos"].apply(lambda x: len(x) == 0)
-    deduped["motivos_texto"] = deduped["motivos"].apply(", ".join)
-    deduped["telefono_mostrar"] = deduped.apply(
-        lambda row: phone_for_display(row["telefono_original"], row["telefono_normalizado"]),
-        axis=1,
-    )
-
-    totals = work.groupby("agencia").size().rename("telefonos_totales")
-    dedup_totals = deduped.groupby("agencia").size().rename("telefonos_deduplicados")
-    valid_totals = deduped.groupby("agencia")["es_valido"].sum().astype(int).rename("telefonos_validos")
-
-    summary = pd.concat([totals, dedup_totals, valid_totals], axis=1).fillna(0).astype(int)
-    summary["telefonos_repetidos"] = summary["telefonos_totales"] - summary["telefonos_deduplicados"]
-    summary["telefonos_no_validos"] = summary["telefonos_deduplicados"] - summary["telefonos_validos"]
-    summary["porcentaje_validos"] = [
-        format_percent(valid, deduped_count)
-        for valid, deduped_count in zip(
-            summary["telefonos_validos"],
-            summary["telefonos_deduplicados"],
-        )
+    summary = summary.astype(int)
+    summary["leads_sin_telefono"] = summary["leads_totales"] - summary["leads_con_algun_telefono"]
+    summary["leads_validos_unicos"] = leads.groupby("agencia")["estado"].apply(lambda values: (values == "valido_unico").sum())
+    summary["leads_repetidos"] = leads.groupby("agencia")["estado"].apply(lambda values: (values == "repetido").sum())
+    summary["leads_no_validos"] = leads.groupby("agencia")["estado"].apply(lambda values: (values == "no_valido").sum())
+    summary = summary.fillna(0).astype(int)
+    summary["porcentaje_validos_unicos"] = [
+        format_percent(valid, total)
+        for valid, total in zip(summary["leads_validos_unicos"], summary["leads_totales"])
     ]
 
     invalid_examples = (
-        deduped.loc[~deduped["es_valido"]]
-        .groupby("agencia")["telefono_mostrar"]
-        .apply(lambda values: ", ".join(values.astype(str).head(30)))
-        .rename("telefonos_no_validos_ejemplo")
+        leads.loc[leads["estado"] == "no_valido"]
+        .groupby("agencia")["telefonos_encontrados"]
+        .apply(lambda values: ", ".join(values.astype(str).head(20)))
+        .rename("ejemplos_no_validos")
     )
-
     summary = summary.join(invalid_examples)
-    summary["telefonos_no_validos_ejemplo"] = summary["telefonos_no_validos_ejemplo"].fillna("")
+    summary["ejemplos_no_validos"] = summary["ejemplos_no_validos"].fillna("")
     summary = summary.reset_index()
-    summary = summary.sort_values(["telefonos_validos", "agencia"], ascending=[False, True])
+    summary = summary.sort_values(["leads_validos_unicos", "agencia"], ascending=[False, True])
 
-    invalids = deduped.loc[
-        ~deduped["es_valido"],
-        ["fila", "agencia", "columna_telefono", "telefono_original", "telefono_normalizado", "motivos_texto"],
-    ].sort_values(["agencia", "telefono_normalizado"])
+    invalids = leads.loc[
+        leads["estado"] == "no_valido",
+        ["fila", "deal_id", "agencia", "telefonos_encontrados", "motivo_no_valido"],
+    ].sort_values(["agencia", "fila"])
 
-    duplicates = work.loc[
-        work["es_repetido"],
-        ["fila", "agencia", "columna_telefono", "telefono_original", "telefono_normalizado"],
-    ].sort_values(["agencia", "telefono_normalizado"])
+    duplicates = leads.loc[
+        leads["estado"] == "repetido",
+        [
+            "fila",
+            "deal_id",
+            "agencia",
+            "telefono_repetido",
+            "columna_telefono_repetido",
+            "fila_original_repetido",
+            "deal_id_original_repetido",
+            "columna_original_repetido",
+            "telefonos_encontrados",
+        ],
+    ].sort_values(["agencia", "telefono_repetido", "fila"])
 
     return summary, invalids, duplicates
 
@@ -225,6 +287,15 @@ def guess_column(columns: list[str], options: list[str]) -> str | None:
     for option in options:
         if option in normalized:
             return normalized[option]
+
+    return None
+
+
+def guess_column_contains(columns: list[str], options: list[str]) -> str | None:
+    for col in columns:
+        normalized = col.lower().strip()
+        if any(option in normalized for option in options):
+            return col
 
     return None
 
@@ -258,6 +329,10 @@ def main() -> None:
     columns = list(df.columns)
 
     agency_guess = guess_column(columns, ["agencia", "agency", "fuente", "origen"])
+    deal_id_guess = guess_column_contains(
+        columns,
+        ["deal id", "deal_id", "id deal", "negocio id", "id negocio"],
+    )
     phone_guesses = [
         col
         for col in columns
@@ -277,53 +352,59 @@ def main() -> None:
         )
 
     with col2:
-        phone_cols = st.multiselect(
-            "Columnas de telefono",
-            columns,
-            default=phone_guesses if phone_guesses else columns[1:2],
+        deal_id_options = ["No incluir Deal ID"] + columns
+        deal_id_col_selected = st.selectbox(
+            "Columna de Deal ID",
+            deal_id_options,
+            index=deal_id_options.index(deal_id_guess) if deal_id_guess in deal_id_options else 0,
         )
 
-    phone_cols = [col for col in phone_cols if col != agency_col]
+    deal_id_col = None if deal_id_col_selected == "No incluir Deal ID" else deal_id_col_selected
+
+    phone_cols = st.multiselect(
+        "Columnas de telefono",
+        columns,
+        default=phone_guesses if phone_guesses else columns[1:2],
+    )
+
+    phone_cols = [col for col in phone_cols if col not in {agency_col, deal_id_col}]
 
     if not phone_cols:
         st.error("Elige al menos una columna de telefono distinta a la columna de agencia.")
         st.stop()
 
-    count_empty_rows = st.checkbox(
-        "Contar filas sin ningun telefono como no validas",
-        value=True,
-    )
-
     summary, invalids, duplicates = analyze_phones(
         df,
         agency_col,
         phone_cols,
-        count_empty_rows=count_empty_rows,
+        deal_id_col=deal_id_col,
     )
 
-    total_phones = int(summary["telefonos_totales"].sum())
-    total_deduped = int(summary["telefonos_deduplicados"].sum())
-    total_valid = int(summary["telefonos_validos"].sum())
-    total_invalid = int(summary["telefonos_no_validos"].sum())
+    total_leads = int(summary["leads_totales"].sum())
+    leads_with_valid_phone = int(summary["leads_con_telefono_valido"].sum())
+    unique_valid_leads = int(summary["leads_validos_unicos"].sum())
+    repeated_leads = int(summary["leads_repetidos"].sum())
+    invalid_leads = int(summary["leads_no_validos"].sum())
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Telefonos totales", total_phones)
-    m2.metric("Telefonos deduplicados", total_deduped)
-    m3.metric("Telefonos validos", total_valid)
-    m4.metric("Telefonos no validos", total_invalid)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Leads totales", total_leads)
+    m2.metric("Leads con telefono valido", leads_with_valid_phone)
+    m3.metric("Leads validos unicos", unique_valid_leads)
+    m4.metric("Leads repetidos", repeated_leads)
+    m5.metric("Leads no validos", invalid_leads)
 
     st.subheader("Resumen por agencia")
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
-    st.subheader("Telefonos no validos")
+    st.subheader("Leads no validos")
     if invalids.empty:
-        st.success("No hay telefonos no validos.")
+        st.success("No hay leads no validos.")
     else:
         st.dataframe(invalids, use_container_width=True, hide_index=True)
 
-    st.subheader("Telefonos repetidos")
+    st.subheader("Leads repetidos por telefono")
     if duplicates.empty:
-        st.success("No hay telefonos repetidos por agencia.")
+        st.success("No hay leads repetidos por telefono dentro de la misma agencia.")
     else:
         st.dataframe(duplicates, use_container_width=True, hide_index=True)
 
