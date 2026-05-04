@@ -1,36 +1,26 @@
 from __future__ import annotations
 
-import argparse
 import re
-from pathlib import Path
+from io import BytesIO
 
 import pandas as pd
+import streamlit as st
 
 
 REPEATED_DIGITS_RE = re.compile(r"^(\d)\1+$")
 
 
 def normalize_phone(value: object) -> str:
-    """
-    Limpia un telefono para validar moviles espanoles.
-
-    Ejemplos:
-    +34 612 345 678 -> 612345678
-    0034 612345678  -> 612345678
-    612-345-678     -> 612345678
-    """
     if pd.isna(value):
         return ""
 
     text = str(value).strip()
 
-    # Evita valores que Excel puede leer como float: 612345678.0
     if re.fullmatch(r"\d+\.0", text):
         text = text[:-2]
 
     digits = re.sub(r"\D+", "", text)
 
-    # Quita prefijos de Espana si el numero restante tiene 9 digitos.
     if len(digits) == 11 and digits.startswith("34"):
         digits = digits[2:]
     elif len(digits) == 13 and digits.startswith("0034"):
@@ -40,14 +30,6 @@ def normalize_phone(value: object) -> str:
 
 
 def has_repeated_pattern(phone: str) -> bool:
-    """
-    Detecta patrones repetidos completos.
-
-    Ejemplos invalidos:
-    678678678
-    123123123
-    666666666
-    """
     for size in range(1, (len(phone) // 2) + 1):
         if len(phone) % size != 0:
             continue
@@ -60,16 +42,6 @@ def has_repeated_pattern(phone: str) -> bool:
 
 
 def invalid_reasons(phone: str) -> list[str]:
-    """
-    Devuelve los motivos por los que un telefono no es valido.
-
-    Reglas:
-    - Debe tener 9 digitos.
-    - Debe empezar por 6 o 7.
-    - No puede ser todo el mismo digito.
-    - No puede ser tipo 600000000, 700000000, 611111111.
-    - No puede ser un patron repetido tipo 678678678.
-    """
     reasons: list[str] = []
 
     if not phone:
@@ -93,16 +65,6 @@ def invalid_reasons(phone: str) -> list[str]:
     return reasons
 
 
-def is_valid_phone(phone: str) -> bool:
-    return len(invalid_reasons(phone)) == 0
-
-
-def format_percent(numerator: int, denominator: int) -> str:
-    if denominator == 0:
-        return "0.00%"
-    return f"{(numerator / denominator) * 100:.2f}%"
-
-
 def phone_for_display(original: object, normalized: str) -> str:
     if normalized:
         return normalized
@@ -113,25 +75,25 @@ def phone_for_display(original: object, normalized: str) -> str:
     return str(original).strip()
 
 
-def analyze_phones(
-    df: pd.DataFrame,
-    agency_col: str = "agencia",
-    phone_col: str = "telefono",
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Analiza telefonos por agencia.
+def format_percent(numerator: int, denominator: int) -> str:
+    if denominator == 0:
+        return "0.00%"
+    return f"{(numerator / denominator) * 100:.2f}%"
 
-    Devuelve:
-    - resumen por agencia
-    - telefonos no validos
-    - telefonos repetidos
-    """
-    if agency_col not in df.columns:
-        raise ValueError(f"No existe la columna de agencia: {agency_col}")
 
-    if phone_col not in df.columns:
-        raise ValueError(f"No existe la columna de telefono: {phone_col}")
+def read_file(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
 
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(uploaded_file)
+
+    raise ValueError("Sube un archivo CSV, XLSX o XLS.")
+
+
+def analyze_phones(df: pd.DataFrame, agency_col: str, phone_col: str):
     work = df[[agency_col, phone_col]].copy()
     work.columns = ["agencia", "telefono_original"]
 
@@ -140,7 +102,6 @@ def analyze_phones(
 
     work["telefono_normalizado"] = work["telefono_original"].apply(normalize_phone)
 
-    # Deduplicado dentro de cada agencia.
     work["es_repetido"] = work.duplicated(
         subset=["agencia", "telefono_normalizado"],
         keep="first",
@@ -148,7 +109,7 @@ def analyze_phones(
 
     deduped = work.loc[~work["es_repetido"]].copy()
     deduped["motivos"] = deduped["telefono_normalizado"].apply(invalid_reasons)
-    deduped["es_valido"] = deduped["motivos"].apply(lambda reasons: len(reasons) == 0)
+    deduped["es_valido"] = deduped["motivos"].apply(lambda x: len(x) == 0)
     deduped["motivos_texto"] = deduped["motivos"].apply(", ".join)
     deduped["telefono_mostrar"] = deduped.apply(
         lambda row: phone_for_display(row["telefono_original"], row["telefono_normalizado"]),
@@ -173,7 +134,7 @@ def analyze_phones(
     invalid_examples = (
         deduped.loc[~deduped["es_valido"]]
         .groupby("agencia")["telefono_mostrar"]
-        .apply(lambda values: ", ".join(values.astype(str).head(20)))
+        .apply(lambda values: ", ".join(values.astype(str).head(30)))
         .rename("telefonos_no_validos_ejemplo")
     )
 
@@ -195,61 +156,108 @@ def analyze_phones(
     return summary, invalids, duplicates
 
 
-def read_input_file(path: str | Path) -> pd.DataFrame:
-    path = Path(path)
+def to_excel(summary: pd.DataFrame, invalids: pd.DataFrame, duplicates: pd.DataFrame) -> bytes:
+    output = BytesIO()
 
-    if path.suffix.lower() == ".csv":
-        return pd.read_csv(path)
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        summary.to_excel(writer, index=False, sheet_name="resumen")
+        invalids.to_excel(writer, index=False, sheet_name="no_validos")
+        duplicates.to_excel(writer, index=False, sheet_name="repetidos")
 
-    if path.suffix.lower() in {".xlsx", ".xls"}:
-        return pd.read_excel(path)
-
-    raise ValueError("El archivo debe ser .csv, .xlsx o .xls")
-
-
-def write_output_file(
-    output_path: str | Path,
-    summary: pd.DataFrame,
-    invalids: pd.DataFrame,
-    duplicates: pd.DataFrame,
-) -> None:
-    output_path = Path(output_path)
-
-    if output_path.suffix.lower() == ".xlsx":
-        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            summary.to_excel(writer, index=False, sheet_name="resumen")
-            invalids.to_excel(writer, index=False, sheet_name="no_validos")
-            duplicates.to_excel(writer, index=False, sheet_name="repetidos")
-        return
-
-    # Si la salida no es xlsx, se crean 3 CSV separados.
-    base = output_path.with_suffix("")
-    summary.to_csv(f"{base}_resumen.csv", index=False)
-    invalids.to_csv(f"{base}_no_validos.csv", index=False)
-    duplicates.to_csv(f"{base}_repetidos.csv", index=False)
+    return output.getvalue()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Valida telefonos por agencia.")
-    parser.add_argument("archivo", help="Archivo de entrada: CSV, XLSX o XLS.")
-    parser.add_argument("--agencia", default="agencia", help="Nombre de la columna de agencia.")
-    parser.add_argument("--telefono", default="telefono", help="Nombre de la columna de telefono.")
-    parser.add_argument("--salida", default="resultado_telefonos.xlsx", help="Archivo de salida.")
-    args = parser.parse_args()
+def guess_column(columns: list[str], options: list[str]) -> str | None:
+    normalized = {col.lower().strip(): col for col in columns}
 
-    df = read_input_file(args.archivo)
-    summary, invalids, duplicates = analyze_phones(
-        df,
-        agency_col=args.agencia,
-        phone_col=args.telefono,
+    for option in options:
+        if option in normalized:
+            return normalized[option]
+
+    return None
+
+
+st.set_page_config(page_title="Validador de telefonos", layout="wide")
+
+st.title("Validador de telefonos por agencia")
+
+uploaded_file = st.file_uploader(
+    "Sube un archivo con una columna de agencia y otra de telefono",
+    type=["csv", "xlsx", "xls"],
+)
+
+if uploaded_file is None:
+    st.info("Sube un CSV o Excel. Despues eliges la columna de agencia y la columna de telefono.")
+    st.stop()
+
+try:
+    df = read_file(uploaded_file)
+except Exception as error:
+    st.error(f"No he podido leer el archivo: {error}")
+    st.stop()
+
+if df.empty:
+    st.warning("El archivo esta vacio.")
+    st.stop()
+
+columns = list(df.columns)
+
+agency_guess = guess_column(columns, ["agencia", "agency", "fuente", "origen"])
+phone_guess = guess_column(columns, ["telefono", "teléfono", "phone", "movil", "móvil", "mobile"])
+
+col1, col2 = st.columns(2)
+
+with col1:
+    agency_col = st.selectbox(
+        "Columna de agencia",
+        columns,
+        index=columns.index(agency_guess) if agency_guess in columns else 0,
     )
 
-    write_output_file(args.salida, summary, invalids, duplicates)
+with col2:
+    phone_col = st.selectbox(
+        "Columna de telefono",
+        columns,
+        index=columns.index(phone_guess) if phone_guess in columns else min(1, len(columns) - 1),
+    )
 
-    print("\nRESUMEN POR AGENCIA")
-    print(summary.to_string(index=False))
-    print(f"\nResultado guardado en: {args.salida}")
+if agency_col == phone_col:
+    st.error("La columna de agencia y la columna de telefono no pueden ser la misma.")
+    st.stop()
 
+summary, invalids, duplicates = analyze_phones(df, agency_col, phone_col)
 
-if __name__ == "__main__":
-    main()
+total_phones = int(summary["telefonos_totales"].sum())
+total_deduped = int(summary["telefonos_deduplicados"].sum())
+total_valid = int(summary["telefonos_validos"].sum())
+total_invalid = int(summary["telefonos_no_validos"].sum())
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Telefonos totales", total_phones)
+m2.metric("Telefonos deduplicados", total_deduped)
+m3.metric("Telefonos validos", total_valid)
+m4.metric("Telefonos no validos", total_invalid)
+
+st.subheader("Resumen por agencia")
+st.dataframe(summary, use_container_width=True, hide_index=True)
+
+st.subheader("Telefonos no validos")
+if invalids.empty:
+    st.success("No hay telefonos no validos.")
+else:
+    st.dataframe(invalids, use_container_width=True, hide_index=True)
+
+st.subheader("Telefonos repetidos")
+if duplicates.empty:
+    st.success("No hay telefonos repetidos por agencia.")
+else:
+    st.dataframe(duplicates, use_container_width=True, hide_index=True)
+
+excel_file = to_excel(summary, invalids, duplicates)
+
+st.download_button(
+    label="Descargar resultado en Excel",
+    data=excel_file,
+    file_name="resultado_telefonos.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
