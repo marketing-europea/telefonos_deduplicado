@@ -7,7 +7,9 @@ import pandas as pd
 
 
 REPEATED_DIGITS_RE = re.compile(r"^(\d)\1+$")
+EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 VALID_START_DIGITS = {"6", "7", "8", "9"}
+DEFAULT_BLOCKED_EMAIL_DOMAINS = "fakedbleads.com"
 
 
 def normalize_phone(value: object) -> str:
@@ -82,6 +84,50 @@ def phone_for_display(original: object, normalized: str) -> str:
     return str(original).strip()
 
 
+def split_email_values(value: object) -> list[str]:
+    if not has_value(value):
+        return []
+
+    text = str(value).strip()
+    return [part.strip().lower() for part in re.split(r"[,;\s]+", text) if part.strip()]
+
+
+def normalize_domain(domain: str) -> str:
+    domain = domain.strip().lower()
+    domain = re.sub(r"^https?://", "", domain)
+    domain = domain.removeprefix("www.")
+    domain = domain.removeprefix("@")
+    return domain.strip().strip("/")
+
+
+def parse_blocked_domains(text: str) -> set[str]:
+    domains = set()
+    for part in re.split(r"[,;\s]+", text):
+        domain = normalize_domain(part)
+        if domain:
+            domains.add(domain)
+    return domains
+
+
+def invalid_email_reasons(email: str, blocked_domains: set[str]) -> list[str]:
+    reasons: list[str] = []
+    email = str(email).strip().lower()
+
+    if not email:
+        return ["vacio"]
+
+    domain = email.split("@")[-1] if "@" in email else email
+    domain = normalize_domain(domain)
+
+    if any(domain == blocked or domain.endswith(f".{blocked}") for blocked in blocked_domains):
+        reasons.append("dominio bloqueado")
+
+    if not EMAIL_RE.fullmatch(email):
+        reasons.append("formato email invalido")
+
+    return reasons
+
+
 def format_percent(numerator: int, denominator: int) -> str:
     if denominator == 0:
         return "0.00%"
@@ -109,13 +155,25 @@ def analyze_phones(
     agency_col: str,
     phone_cols: list[str],
     deal_id_col: str | None = None,
+    email_cols: list[str] | None = None,
+    blocked_email_domains: set[str] | None = None,
 ):
-    base_cols = list(dict.fromkeys([agency_col] + phone_cols + ([deal_id_col] if deal_id_col else [])))
+    email_cols = email_cols or []
+    blocked_email_domains = blocked_email_domains or set()
+    base_cols = list(
+        dict.fromkeys(
+            [agency_col]
+            + phone_cols
+            + email_cols
+            + ([deal_id_col] if deal_id_col else [])
+        )
+    )
     base = df[base_cols].copy()
     base["_row_id"] = range(1, len(base) + 1)
 
     seen_valid_phones: dict[tuple[str, str], dict[str, object]] = {}
     lead_rows = []
+    invalid_email_rows = []
 
     for _, row in base.iterrows():
         agency = row[agency_col]
@@ -148,6 +206,25 @@ def analyze_phones(
                     "es_valido": len(reasons) == 0,
                 }
             )
+
+        email_candidates = []
+        for email_col in email_cols:
+            original_email = row[email_col]
+            for email in split_email_values(original_email):
+                email_reasons = invalid_email_reasons(email, blocked_email_domains)
+                email_candidate = {
+                    "fila": int(row["_row_id"]),
+                    "deal_id": deal_id,
+                    "agencia": agency,
+                    "columna_email": email_col,
+                    "email": email,
+                    "motivos_texto": ", ".join(email_reasons),
+                    "es_valido": len(email_reasons) == 0,
+                }
+                email_candidates.append(email_candidate)
+
+                if email_reasons:
+                    invalid_email_rows.append(email_candidate)
 
         valid_candidates = []
         phones_seen_in_this_lead = set()
@@ -206,6 +283,20 @@ def analyze_phones(
                 if not candidate["es_valido"]
             )
 
+        if not email_candidates:
+            emails_text = ""
+            invalid_email_reason_text = ""
+        else:
+            emails_text = "; ".join(
+                f"{candidate['columna_email']}: {candidate['email']}"
+                for candidate in email_candidates
+            )
+            invalid_email_reason_text = "; ".join(
+                f"{candidate['columna_email']}: {candidate['email']} ({candidate['motivos_texto']})"
+                for candidate in email_candidates
+                if not candidate["es_valido"]
+            )
+
         lead_rows.append(
             {
                 "fila": int(row["_row_id"]),
@@ -223,15 +314,23 @@ def analyze_phones(
                 "fila_original_repetido": repeated["fila_original"] if repeated else "",
                 "deal_id_original_repetido": repeated["deal_id_original"] if repeated else "",
                 "columna_original_repetido": repeated["columna_original"] if repeated else "",
+                "tiene_email_invalido": any(not candidate["es_valido"] for candidate in email_candidates),
+                "emails_encontrados": emails_text,
+                "motivo_email_invalido": invalid_email_reason_text,
             }
         )
 
     leads = pd.DataFrame(lead_rows)
+    invalid_emails = pd.DataFrame(
+        invalid_email_rows,
+        columns=["fila", "deal_id", "agencia", "columna_email", "email", "motivos_texto", "es_valido"],
+    )
 
     summary = leads.groupby("agencia").agg(
         leads_totales=("fila", "count"),
         leads_con_algun_telefono=("tiene_algun_telefono", "sum"),
         leads_con_telefono_valido=("tiene_telefono_valido", "sum"),
+        leads_con_email_invalido=("tiene_email_invalido", "sum"),
     )
     summary = summary.astype(int)
     summary["leads_sin_telefono"] = summary["leads_totales"] - summary["leads_con_algun_telefono"]
@@ -275,16 +374,25 @@ def analyze_phones(
         ],
     ].sort_values(["agencia", "telefono_repetido", "fila"])
 
-    return summary, invalids, duplicates
+    invalid_emails = invalid_emails.drop(columns=["es_valido"], errors="ignore")
+    invalid_emails = invalid_emails.sort_values(["agencia", "fila", "email"])
+
+    return summary, invalids, duplicates, invalid_emails
 
 
-def to_excel(summary: pd.DataFrame, invalids: pd.DataFrame, duplicates: pd.DataFrame) -> bytes:
+def to_excel(
+    summary: pd.DataFrame,
+    invalids: pd.DataFrame,
+    duplicates: pd.DataFrame,
+    invalid_emails: pd.DataFrame,
+) -> bytes:
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         summary.to_excel(writer, index=False, sheet_name="resumen")
         invalids.to_excel(writer, index=False, sheet_name="no_validos")
         duplicates.to_excel(writer, index=False, sheet_name="repetidos")
+        invalid_emails.to_excel(writer, index=False, sheet_name="emails_no_validos")
 
     return output.getvalue()
 
@@ -311,17 +419,17 @@ def guess_column_contains(columns: list[str], options: list[str]) -> str | None:
 def main() -> None:
     import streamlit as st
 
-    st.set_page_config(page_title="Validador de telefonos", layout="wide")
+    st.set_page_config(page_title="Validador de leads", layout="wide")
 
-    st.title("Validador de telefonos por agencia")
+    st.title("Validador de leads por agencia")
 
     uploaded_file = st.file_uploader(
-        "Sube un archivo con una columna de agencia y una o varias columnas de telefono",
+        "Sube un archivo con agencia, telefonos y emails",
         type=["csv", "xlsx", "xls"],
     )
 
     if uploaded_file is None:
-        st.info("Sube un CSV o Excel. Despues eliges la columna de agencia y todas las columnas de telefono.")
+        st.info("Sube un CSV o Excel. Despues eliges la columna de agencia, telefonos y emails.")
         st.stop()
 
     try:
@@ -347,6 +455,14 @@ def main() -> None:
         if any(
             keyword in col.lower()
             for keyword in ["telefono", "teléfono", "phone", "movil", "móvil", "mobile"]
+        )
+    ]
+    email_guesses = [
+        col
+        for col in columns
+        if any(
+            keyword in col.lower()
+            for keyword in ["correo", "email", "mail", "e-mail", "electr"]
         )
     ]
 
