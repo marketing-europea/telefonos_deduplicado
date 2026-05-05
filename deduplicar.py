@@ -7,6 +7,7 @@ import pandas as pd
 
 
 REPEATED_DIGITS_RE = re.compile(r"^(\d)\1+$")
+VALID_START_DIGITS = {"6", "7", "8", "9"}
 
 
 def normalize_phone(value: object) -> str:
@@ -40,6 +41,13 @@ def has_repeated_pattern(phone: str) -> bool:
     return False
 
 
+def has_valid_spanish_prefix(phone: str) -> bool:
+    if len(phone) != 9:
+        return False
+
+    return phone[0] in VALID_START_DIGITS
+
+
 def invalid_reasons(phone: str) -> list[str]:
     reasons: list[str] = []
 
@@ -49,13 +57,13 @@ def invalid_reasons(phone: str) -> list[str]:
     if len(phone) != 9:
         reasons.append("no tiene 9 digitos")
 
-    if phone[0] not in {"6", "7"}:
-        reasons.append("no empieza por 6 o 7")
+    if not has_valid_spanish_prefix(phone):
+        reasons.append("no empieza por 6, 7, 8 o 9")
 
     if REPEATED_DIGITS_RE.fullmatch(phone):
         reasons.append("digitos repetidos")
 
-    if len(phone) == 9 and phone[0] in {"6", "7"} and len(set(phone[1:])) == 1:
+    if len(phone) == 9 and len(set(phone[1:])) == 1:
         reasons.append("demasiado repetitivo")
 
     if has_repeated_pattern(phone):
@@ -380,11 +388,25 @@ def main() -> None:
         deal_id_col=deal_id_col,
     )
 
-    total_leads = int(summary["leads_totales"].sum())
-    leads_with_valid_phone = int(summary["leads_con_telefono_valido"].sum())
-    unique_valid_leads = int(summary["leads_validos_unicos"].sum())
-    repeated_leads = int(summary["leads_repetidos"].sum())
-    invalid_leads = int(summary["leads_no_validos"].sum())
+    agency_options = ["Todas las agencias"] + sorted(summary["agencia"].astype(str).unique().tolist())
+    selected_agency = st.selectbox("Filtrar por agencia", agency_options)
+
+    if selected_agency == "Todas las agencias":
+        filtered_summary = summary
+        filtered_invalids = invalids
+        filtered_duplicates = duplicates
+        file_suffix = "todas"
+    else:
+        filtered_summary = summary.loc[summary["agencia"] == selected_agency]
+        filtered_invalids = invalids.loc[invalids["agencia"] == selected_agency]
+        filtered_duplicates = duplicates.loc[duplicates["agencia"] == selected_agency]
+        file_suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", selected_agency).strip("_").lower() or "agencia"
+
+    total_leads = int(filtered_summary["leads_totales"].sum())
+    leads_with_valid_phone = int(filtered_summary["leads_con_telefono_valido"].sum())
+    unique_valid_leads = int(filtered_summary["leads_validos_unicos"].sum())
+    repeated_leads = int(filtered_summary["leads_repetidos"].sum())
+    invalid_leads = int(filtered_summary["leads_no_validos"].sum())
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Leads totales", total_leads)
@@ -394,26 +416,32 @@ def main() -> None:
     m5.metric("Leads no validos", invalid_leads)
 
     st.subheader("Resumen por agencia")
-    st.dataframe(summary, use_container_width=True, hide_index=True)
+    st.dataframe(filtered_summary, use_container_width=True, hide_index=True)
 
     st.subheader("Leads no validos")
-    if invalids.empty:
+    if filtered_invalids.empty:
         st.success("No hay leads no validos.")
     else:
-        st.dataframe(invalids, use_container_width=True, hide_index=True)
+        st.dataframe(filtered_invalids, use_container_width=True, hide_index=True)
+        st.download_button(
+            label="Descargar no validos filtrados",
+            data=filtered_invalids.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"no_validos_{file_suffix}.csv",
+            mime="text/csv",
+        )
 
     st.subheader("Leads repetidos por telefono")
-    if duplicates.empty:
+    if filtered_duplicates.empty:
         st.success("No hay leads repetidos por telefono dentro de la misma agencia.")
     else:
-        st.dataframe(duplicates, use_container_width=True, hide_index=True)
+        st.dataframe(filtered_duplicates, use_container_width=True, hide_index=True)
 
-    excel_file = to_excel(summary, invalids, duplicates)
+    excel_file = to_excel(filtered_summary, filtered_invalids, filtered_duplicates)
 
     st.download_button(
-        label="Descargar resultado en Excel",
+        label="Descargar resultado filtrado en Excel",
         data=excel_file,
-        file_name="resultado_telefonos.xlsx",
+        file_name=f"resultado_telefonos_{file_suffix}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
