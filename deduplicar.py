@@ -43,6 +43,10 @@ def has_repeated_pattern(phone: str) -> bool:
     return False
 
 
+def yes_no(value: bool) -> str:
+    return "si" if value else "no"
+
+
 def has_valid_spanish_prefix(phone: str) -> bool:
     if len(phone) != 9:
         return False
@@ -223,9 +227,6 @@ def analyze_phones(
                 }
                 email_candidates.append(email_candidate)
 
-                if email_reasons:
-                    invalid_email_rows.append(email_candidate)
-
         valid_candidates = []
         phones_seen_in_this_lead = set()
         for candidate in candidates:
@@ -258,6 +259,19 @@ def analyze_phones(
             status = "no_valido"
             main_valid = None
             repeated = None
+
+        has_any_email = len(email_candidates) > 0
+        has_valid_email = any(candidate["es_valido"] for candidate in email_candidates)
+        has_invalid_email = any(not candidate["es_valido"] for candidate in email_candidates)
+
+        if not has_any_email:
+            email_status = "sin_email"
+        elif has_valid_email and has_invalid_email:
+            email_status = "email_valido_y_email_invalido"
+        elif has_valid_email:
+            email_status = "email_valido"
+        else:
+            email_status = "email_invalido"
 
         for candidate in valid_candidates:
             key = (agency, str(candidate["telefono_normalizado"]))
@@ -297,6 +311,20 @@ def analyze_phones(
                 if not candidate["es_valido"]
             )
 
+        for candidate in email_candidates:
+            if candidate["es_valido"]:
+                continue
+
+            invalid_email_rows.append(
+                {
+                    **candidate,
+                    "estado_telefono_lead": status,
+                    "lead_sin_telefono_valido": yes_no(status == "no_valido"),
+                    "telefono_valido_lead": main_valid["telefono_normalizado"] if main_valid else "",
+                    "telefonos_encontrados": phones_text,
+                }
+            )
+
         lead_rows.append(
             {
                 "fila": int(row["_row_id"]),
@@ -314,7 +342,12 @@ def analyze_phones(
                 "fila_original_repetido": repeated["fila_original"] if repeated else "",
                 "deal_id_original_repetido": repeated["deal_id_original"] if repeated else "",
                 "columna_original_repetido": repeated["columna_original"] if repeated else "",
-                "tiene_email_invalido": any(not candidate["es_valido"] for candidate in email_candidates),
+                "estado_email": email_status,
+                "tiene_algun_email": has_any_email,
+                "tiene_email_valido": has_valid_email,
+                "tiene_email_invalido": has_invalid_email,
+                "telefono_no_valido_y_email_invalido": yes_no(status == "no_valido" and has_invalid_email),
+                "telefono_no_valido_y_sin_email_valido": yes_no(status == "no_valido" and not has_valid_email),
                 "emails_encontrados": emails_text,
                 "motivo_email_invalido": invalid_email_reason_text,
             }
@@ -323,20 +356,45 @@ def analyze_phones(
     leads = pd.DataFrame(lead_rows)
     invalid_emails = pd.DataFrame(
         invalid_email_rows,
-        columns=["fila", "deal_id", "agencia", "columna_email", "email", "motivos_texto", "es_valido"],
+        columns=[
+            "fila",
+            "deal_id",
+            "agencia",
+            "columna_email",
+            "email",
+            "motivos_texto",
+            "estado_telefono_lead",
+            "lead_sin_telefono_valido",
+            "telefono_valido_lead",
+            "telefonos_encontrados",
+            "es_valido",
+        ],
     )
 
     summary = leads.groupby("agencia").agg(
         leads_totales=("fila", "count"),
         leads_con_algun_telefono=("tiene_algun_telefono", "sum"),
         leads_con_telefono_valido=("tiene_telefono_valido", "sum"),
+        leads_con_algun_email=("tiene_algun_email", "sum"),
+        leads_con_email_valido=("tiene_email_valido", "sum"),
         leads_con_email_invalido=("tiene_email_invalido", "sum"),
     )
     summary = summary.astype(int)
     summary["leads_sin_telefono"] = summary["leads_totales"] - summary["leads_con_algun_telefono"]
+    summary["leads_sin_email"] = summary["leads_totales"] - summary["leads_con_algun_email"]
+    summary["leads_sin_email_valido"] = summary["leads_totales"] - summary["leads_con_email_valido"]
     summary["leads_validos_unicos"] = leads.groupby("agencia")["estado"].apply(lambda values: (values == "valido_unico").sum())
     summary["leads_repetidos"] = leads.groupby("agencia")["estado"].apply(lambda values: (values == "repetido").sum())
     summary["leads_no_validos"] = leads.groupby("agencia")["estado"].apply(lambda values: (values == "no_valido").sum())
+    summary["leads_no_validos_con_email_invalido"] = leads.groupby("agencia")[
+        "telefono_no_valido_y_email_invalido"
+    ].apply(lambda values: (values == "si").sum())
+    summary["leads_no_validos_sin_email_valido"] = leads.groupby("agencia")[
+        "telefono_no_valido_y_sin_email_valido"
+    ].apply(lambda values: (values == "si").sum())
+    summary["leads_no_validos_sin_email"] = leads.groupby("agencia").apply(
+        lambda group: ((group["estado"] == "no_valido") & (~group["tiene_algun_email"])).sum()
+    )
     summary = summary.fillna(0).astype(int)
     summary["porcentaje_validos_unicos"] = [
         format_percent(valid, total)
@@ -356,7 +414,18 @@ def analyze_phones(
 
     invalids = leads.loc[
         leads["estado"] == "no_valido",
-        ["fila", "deal_id", "agencia", "telefonos_encontrados", "motivo_no_valido"],
+        [
+            "fila",
+            "deal_id",
+            "agencia",
+            "telefonos_encontrados",
+            "motivo_no_valido",
+            "estado_email",
+            "telefono_no_valido_y_email_invalido",
+            "telefono_no_valido_y_sin_email_valido",
+            "emails_encontrados",
+            "motivo_email_invalido",
+        ],
     ].sort_values(["agencia", "fila"])
 
     duplicates = leads.loc[
@@ -414,6 +483,19 @@ def guess_column_contains(columns: list[str], options: list[str]) -> str | None:
             return col
 
     return None
+
+
+def highlight_yes_rows(df: pd.DataFrame, column: str):
+    if df.empty or column not in df.columns:
+        return df
+
+    return df.style.apply(
+        lambda row: [
+            "background-color: #ffe6e6" if row[column] == "si" else ""
+            for _ in row
+        ],
+        axis=1,
+    )
 
 
 def main() -> None:
@@ -542,6 +624,13 @@ def main() -> None:
     repeated_leads = int(filtered_summary["leads_repetidos"].sum())
     invalid_leads = int(filtered_summary["leads_no_validos"].sum())
     invalid_email_leads = int(filtered_summary["leads_con_email_invalido"].sum())
+    invalid_phone_and_invalid_email = int(filtered_summary["leads_no_validos_con_email_invalido"].sum())
+    invalid_phone_without_valid_email = int(filtered_summary["leads_no_validos_sin_email_valido"].sum())
+    invalid_emails_without_valid_phone = int(
+        (filtered_invalid_emails["lead_sin_telefono_valido"] == "si").sum()
+        if "lead_sin_telefono_valido" in filtered_invalid_emails.columns
+        else 0
+    )
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Leads totales", total_leads)
@@ -549,7 +638,12 @@ def main() -> None:
     m3.metric("Leads validos unicos", unique_valid_leads)
     m4.metric("Leads repetidos", repeated_leads)
     m5.metric("Leads no validos", invalid_leads)
-    m6.metric("Emails invalidos", invalid_email_leads)
+    m6.metric("Leads con email invalido", invalid_email_leads)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("No validos + email invalido", invalid_phone_and_invalid_email)
+    c2.metric("No validos sin email valido", invalid_phone_without_valid_email)
+    c3.metric("Emails invalidos sin telefono valido", invalid_emails_without_valid_phone)
 
     st.subheader("Resumen por agencia")
     st.dataframe(filtered_summary, use_container_width=True, hide_index=True)
@@ -558,7 +652,11 @@ def main() -> None:
     if filtered_invalids.empty:
         st.success("No hay leads no validos.")
     else:
-        st.dataframe(filtered_invalids, use_container_width=True, hide_index=True)
+        st.dataframe(
+            highlight_yes_rows(filtered_invalids, "telefono_no_valido_y_email_invalido"),
+            use_container_width=True,
+            hide_index=True,
+        )
         st.download_button(
             label="Descargar no validos filtrados",
             data=filtered_invalids.to_csv(index=False).encode("utf-8-sig"),
@@ -576,7 +674,11 @@ def main() -> None:
     if filtered_invalid_emails.empty:
         st.success("No hay emails no validos.")
     else:
-        st.dataframe(filtered_invalid_emails, use_container_width=True, hide_index=True)
+        st.dataframe(
+            highlight_yes_rows(filtered_invalid_emails, "lead_sin_telefono_valido"),
+            use_container_width=True,
+            hide_index=True,
+        )
         st.download_button(
             label="Descargar emails no validos filtrados",
             data=filtered_invalid_emails.to_csv(index=False).encode("utf-8-sig"),
