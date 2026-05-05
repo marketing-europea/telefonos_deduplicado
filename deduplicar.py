@@ -497,11 +497,27 @@ def main() -> None:
         st.error("Elige al menos una columna de telefono distinta a la columna de agencia.")
         st.stop()
 
-    summary, invalids, duplicates = analyze_phones(
+    email_cols = st.multiselect(
+        "Columnas de email",
+        columns,
+        default=email_guesses,
+    )
+    email_cols = [col for col in email_cols if col not in {agency_col, deal_id_col} and col not in phone_cols]
+
+    blocked_domains_text = st.text_area(
+        "Dominios de email bloqueados",
+        value=DEFAULT_BLOCKED_EMAIL_DOMAINS,
+        help="Separalos por coma, espacio o salto de linea. Ejemplo: fakedbleads.com",
+    )
+    blocked_email_domains = parse_blocked_domains(blocked_domains_text)
+
+    summary, invalids, duplicates, invalid_emails = analyze_phones(
         df,
         agency_col,
         phone_cols,
         deal_id_col=deal_id_col,
+        email_cols=email_cols,
+        blocked_email_domains=blocked_email_domains,
     )
 
     agency_options = ["Todas las agencias"] + sorted(summary["agencia"].astype(str).unique().tolist())
@@ -511,11 +527,13 @@ def main() -> None:
         filtered_summary = summary
         filtered_invalids = invalids
         filtered_duplicates = duplicates
+        filtered_invalid_emails = invalid_emails
         file_suffix = "todas"
     else:
         filtered_summary = summary.loc[summary["agencia"] == selected_agency]
         filtered_invalids = invalids.loc[invalids["agencia"] == selected_agency]
         filtered_duplicates = duplicates.loc[duplicates["agencia"] == selected_agency]
+        filtered_invalid_emails = invalid_emails.loc[invalid_emails["agencia"] == selected_agency]
         file_suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", selected_agency).strip("_").lower() or "agencia"
 
     total_leads = int(filtered_summary["leads_totales"].sum())
@@ -523,13 +541,15 @@ def main() -> None:
     unique_valid_leads = int(filtered_summary["leads_validos_unicos"].sum())
     repeated_leads = int(filtered_summary["leads_repetidos"].sum())
     invalid_leads = int(filtered_summary["leads_no_validos"].sum())
+    invalid_email_leads = int(filtered_summary["leads_con_email_invalido"].sum())
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Leads totales", total_leads)
     m2.metric("Leads con telefono valido", leads_with_valid_phone)
     m3.metric("Leads validos unicos", unique_valid_leads)
     m4.metric("Leads repetidos", repeated_leads)
     m5.metric("Leads no validos", invalid_leads)
+    m6.metric("Emails invalidos", invalid_email_leads)
 
     st.subheader("Resumen por agencia")
     st.dataframe(filtered_summary, use_container_width=True, hide_index=True)
@@ -552,12 +572,24 @@ def main() -> None:
     else:
         st.dataframe(filtered_duplicates, use_container_width=True, hide_index=True)
 
-    excel_file = to_excel(filtered_summary, filtered_invalids, filtered_duplicates)
+    st.subheader("Emails no validos")
+    if filtered_invalid_emails.empty:
+        st.success("No hay emails no validos.")
+    else:
+        st.dataframe(filtered_invalid_emails, use_container_width=True, hide_index=True)
+        st.download_button(
+            label="Descargar emails no validos filtrados",
+            data=filtered_invalid_emails.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"emails_no_validos_{file_suffix}.csv",
+            mime="text/csv",
+        )
+
+    excel_file = to_excel(filtered_summary, filtered_invalids, filtered_duplicates, filtered_invalid_emails)
 
     st.download_button(
         label="Descargar resultado filtrado en Excel",
         data=excel_file,
-        file_name=f"resultado_telefonos_{file_suffix}.xlsx",
+        file_name=f"resultado_leads_{file_suffix}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
